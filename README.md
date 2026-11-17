@@ -46,7 +46,8 @@
 | Python | 3.9+（`pip install -r requirements.txt`） |
 | Node.js | TagUI 运行依赖 |
 | JDK | 17+ |
-| 微信 | 桌面版（**版本 4.1.12.26**），已登录，**保持窗口可见** |
+| 微信 | 桌面版（**版本 4.1.12.55**），已登录，**保持窗口可见** |
+![Uploading image.png…]()
 
 依赖清单：`numpy`、`pillow`、`opencv-python`、`rapidocr_onnxruntime`（OCR 引擎）、`pyperclip`。
 
