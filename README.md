@@ -47,7 +47,8 @@
 | Node.js | TagUI 运行依赖 |
 | JDK | 17+ |
 | 微信 | 桌面版（**版本 4.1.12.55**），已登录，**保持窗口可见** |
-![Uploading image.png…]()
+<img width="1442" height="848" alt="image" src="https://github.com/user-attachments/assets/26607648-ba83-4d09-b358-c34bb53ff703" />
+
 
 依赖清单：`numpy`、`pillow`、`opencv-python`、`rapidocr_onnxruntime`（OCR 引擎）、`pyperclip`。
 
