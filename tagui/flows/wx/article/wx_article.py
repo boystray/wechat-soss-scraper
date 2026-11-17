@@ -146,7 +146,7 @@ POS_TABBAR_RATIO = (0.47, 24)   # 鼠标移到顶部标签栏(宽度 47% 处),�
 # ---- 重试次数 ----
 RETRY_COPY_URL = 3       # 每轮点更多后查找"复制链接"重试次数
 RETRY_DETAIL_ROUNDS = 2  # 每篇文章最多进详情页轮数(失败关标签重进)
-RETRY_ARTICLE_TAB = 3    # 点击"文章"标签重试次数
+RETRY_ARTICLE_TAB = 5    # 点击"文章"标签重试次数
 
 # ---- 统一运行时缓存(滚动校准 / 布局学习 / 控件坐标侦查 合并到单一 cache.json) ----
 # 原 scroll_calib.json / layout.json / input_field_cache.json / article_cache.json
@@ -179,29 +179,12 @@ def get_pid2name():
 
 
 def find_wx_window():
-    """找到可见的 WeChatAppEx(搜一搜)窗口,返回 hwnd 或 None。
-    优先可见窗口(排除隐藏的音乐和音频等);若无可见则取第一个带标题的。"""
-    pid2name = get_pid2name()
-    found = []
-
-    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def cb(hwnd, lparam):
-        pid = wintypes.DWORD()
-        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-        if pid2name.get(pid.value) == 'WeChatAppEx.exe':
-            buf = ctypes.create_unicode_buffer(128)
-            user32.GetWindowTextW(hwnd, buf, 128)
-            if buf.value and user32.IsWindowVisible(hwnd):
-                found.append(hwnd)
-        return True
-
-    user32.EnumWindows(cb, 0)
-    # 优先全屏窗口(搜一搜通常铺满屏幕)
-    for hwnd in found:
-        l, t, r, b = win_rect(hwnd)
-        if (r - l) >= 1000 and (b - t) >= 600:
-            return hwnd
-    return found[0] if found else None
+    """找到微信窗口。新版微信搜一搜不是独立进程，直接返回主窗口"""
+    # 【强制补丁】新版微信没有独立搜一搜窗口，直接返回主窗口
+    main_win = find_weixin_main()
+    if main_win:
+        return main_win
+    return None
 
 
 def find_weixin_main():
@@ -552,21 +535,21 @@ def _anchor_title(hwnd, items):
 
 
 def _calibrate_scroll_px(hwnd, l, t, r, b, tries=3):
-    """实测"滚轮 1 格 = 多少像素": 锚定一个已知标题 -> 滚动 1 格 ->
-    重新 OCR 定位同一标题的 cy -> 两次 cy 差值即 1 格像素。
-    多次取中位数抗抖。失败返回 None(调用方用 SCROLL_PX_PER_CLICK 兜底)。
-    注意: 这会真实滚动列表,调用方需在已进列表页后执行。"""
-    # 滚动前: 找锚点标题及其 cy
+    """实测"滚轮 1 格 = 多少像素"。
+    返回 (px_per_click, actual_scrolled_clicks)。失败返回 (None, 0)。"""
     items, _ = list_ocr(hwnd)
     anchor = _anchor_title(hwnd, items)
     if not anchor:
-        return None
+        return None, 0
     nt, cy0 = anchor
-    scroll_x = l + int((r - l) * 0.5)
-    scroll_y = t + int((b - t) * 0.7)
+    # 修复：把 0.5 改为 0.88，与正式滚动保持同一右侧列表区域
+    scroll_x = l + int((r - l) * 0.88)
+    scroll_y = t + int((b - t) * 0.5)
     diffs = []
+    scrolled_clicks = 0
     for i in range(tries):
         scroll_wheel(scroll_x, scroll_y, 1, 'down')
+        scrolled_clicks += 1
         time.sleep(SLEEP_WHEEL)
         items2, _ = list_ocr(hwnd)
         cy1 = None
@@ -575,34 +558,36 @@ def _calibrate_scroll_px(hwnd, l, t, r, b, tries=3):
                 cy1 = it.get('cy')
                 break
         if cy1 is not None:
-            d = abs(cy1 - cy0)   # 向下滚动标题上移(cy 变小),差取绝对值
-            if 30 < d < 400:   # 合理范围过滤(非 0/过大异常值)
+            d = abs(cy1 - cy0)
+            if 30 < d < 400:
                 diffs.append(d)
-        cy0 = cy1 if cy1 is not None else cy0
+        # 如果锚点已经滚出屏幕外（找不到 cy1），提前结束循环，避免白滚
+        if cy1 is None:
+            break
+        cy0 = cy1
     if not diffs:
-        return None
+        return None, scrolled_clicks
     diffs.sort()
-    return float(diffs[len(diffs) // 2])
+    return float(diffs[len(diffs) // 2]), scrolled_clicks
+
 
 
 def get_scroll_px(hwnd, l, t, r, b, refresh=False):
-    """获取滚轮 1 格像素: 优先读统一缓存 scroll 分区;无缓存或 refresh 时实测。
-    实测成功写缓存(跨运行复用)。全部失败返回 SCROLL_PX_PER_CLICK 兜底。"""
+    """返回 (px_per_click, already_scrolled_clicks)"""
     calib = read_cache(CACHE_SCROLL)
     if not refresh and calib.get('px_per_click'):
         px = float(calib['px_per_click'])
         print('SCROLL_PX_FROM_CACHE=%.1f' % px)
-        return px
-    px = _calibrate_scroll_px(hwnd, l, t, r, b)
+        return px, 0
+    px, scrolled_clicks = _calibrate_scroll_px(hwnd, l, t, r, b)
     if px and px > 0:
         calib['px_per_click'] = px
         calib['measured_at'] = datetime.datetime.now().isoformat(timespec='seconds')
-        write_cache(CACHE_SCROLL, calib)   # 保留 item_height,勿整体覆盖
-        print('SCROLL_PX_CALIBRATED=%.1f (已缓存 %s)' % (px, CACHE_FILE))
-        return px
+        write_cache(CACHE_SCROLL, calib)
+        print('SCROLL_PX_CALIBRATED=%.1f (已缓存)' % px)
+        return px, scrolled_clicks
     print('SCROLL_PX_CALIB_FAIL - 用兜底 %.1f px' % SCROLL_PX_PER_CLICK)
-    return SCROLL_PX_PER_CLICK
-
+    return SCROLL_PX_PER_CLICK, scrolled_clicks
 
 # ================================================================ 公共动作(找+点+日志)
 def click_template(hwnd, template, region=None, threshold=THRESHOLD_TEMPLATE,
@@ -797,7 +782,7 @@ def find_templates(hwnd, template_path, region=None, threshold=0.82,
 def screen_shot(hwnd, path=None):
     """截取窗口区域,可选保存,返回 (PIL.Image, (l,t,r,b))。
     截图前确保窗口在前台,否则截到的是盖住它的其他窗口内容。"""
-    ensure_foreground(hwnd)
+    #ensure_foreground(hwnd)没有其他窗口
     l, t, r, b = win_rect(hwnd)
     shot = ImageGrab.grab(bbox=(l, t, r, b))
     if path:
@@ -1366,35 +1351,24 @@ def _tab_bar_y(ocr_items):
 
 
 def parse_list_items(ocr_items, min_y=0, col_split=None):
-    """从文章列表 OCR 结果解析条目。
-
-    ocr_items: [(cy, x0, x1, text)] 按 y 升序
-    微信搜一搜文章列表为双列/瀑布流布局: 左列标题 x0≈280,右列标题 x0≈970。
-    必须先按 x 分列、每列内独立做"标题+元信息"配对,再合并按 y 排序;
-    否则左右两列交错会把右列标题吞掉、元信息错配(滚动后坐标全错的根因)。
-    col_split 缺省时用布局学习值(get_col_split),兜底 720。
-    有效 min_y = max(min_y, 标签栏行 y + _TAB_BAR_MARGIN): 账号头部
-    (简介/关注/私信/标签栏)整体位于标签栏行之上,标签栏行是列表起始锚点,
-    避免把账号简介误当第一篇文章(点击坐标错位的根因)。
-    返回: [{title, date, read_count, cy, cx, cx0}] (date/read_count 可能为 None)
-    """
-    if col_split is None:
-        col_split = get_col_split()
+    # 获取标签栏的 Y 坐标，防止把顶部的“全部/文章”当成第一篇
     tby = _tab_bar_y(ocr_items)
-    if tby is not None:
+    if tby is not None and tby < 450:   # 加上 tby < 450 保护，防止把文章正文误认成标签栏
         min_y = max(min_y, tby + _TAB_BAR_MARGIN)
-    left, right = [], []
+    elif min_y <= 0:
+        min_y = 365  # 兜底：文章标签固定在 y≈355，365 以下全是文章列表
+
+    valid_items = []
     for cy, x0, x1, t in ocr_items:
-        if cy < min_y:
-            continue
-        if x0 < col_split:
-            left.append((cy, x0, x1, t))
-        else:
-            right.append((cy, x0, x1, t))
-    left.sort()
-    right.sort()
-    items = _parse_single_column(left) + _parse_single_column(right)
-    items.sort(key=lambda it: it['cy'])
+        if cy >= min_y:
+            valid_items.append((cy, x0, x1, t))
+            
+    print(f"【调试】parse_list_items: tby={tby}, 最终min_y={min_y}, 有效行数={len(valid_items)}")
+    if valid_items:
+        print("【调试】前5行有效文本:", [(cy, t) for cy, _, _, t in valid_items[:5]])
+        
+    valid_items.sort()
+    items = _parse_single_column(valid_items)
     return items
 
 
@@ -1848,27 +1822,41 @@ def _covered(arts):
 def _pending_ids(arts):
     return [a['id'] for a in arts['items'] if not a.get('url')]
 
-
 def _locate_account(hwnd, l, t):
-    """在搜索结果页 OCR 中定位目标公众号并点击其左缘。
-    返回 True/False。"""
+    """在搜索结果页 OCR 中定位目标公众号并点击；若已在公众号主页则直接放行。"""
     shot, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_results.png'))
     res_items = ocr_image(shot)
     EXCLUDE_PREFIX = ('视频号', '公众号:', '小程序', '表情', '文章', '音乐', '朋友圈')
+    
+    all_texts = [txt.strip() for _, _, _, txt in res_items if txt]
+    
+    # 区分搜索结果页与公众号主页
+    is_search_page = ('AI搜索' in all_texts or '账号' in all_texts or '搜索' in all_texts)
+    in_profile_page = (not is_search_page) and ('文章' in all_texts and ('私信' in all_texts or '视频号' in all_texts))
+
+    prefix_key = _account[:8] if len(_account) >= 8 else _account
+
     cands = []
     for cy, x0, x1, txt in res_items:
-        if cy < 210:
+        clean_txt = txt.strip()
+        if not clean_txt or clean_txt.startswith(EXCLUDE_PREFIX):
             continue
-        if txt == _account:
-            cands.append((cy, x0, x1, txt))
-            continue
-        if _account in txt and not txt.startswith(EXCLUDE_PREFIX):
-            cands.append((cy, x0, x1, txt))
-    cands.sort(key=lambda c: c[0])
+        # 包含完整账号名（包括顶部“六六）清华大学人工智能国际治理研究院”）或前8字前缀（包括“清华大学人工智能国际治理研..”）
+        if _account in clean_txt or prefix_key in clean_txt:
+            cands.append((cy, x0, x1, clean_txt))
+
+    # 排序规则：优先取主体区域(cy >= 210)且靠上的第一个结果；主体没有时才取顶部标题栏(cy < 210)
+    cands.sort(key=lambda c: (0 if c[0] >= 210 else 1, c[0]))
     if not cands:
         print('ERROR - OCR_TARGET_NOT_FOUND: %s' % _account)
-        print('OCR_ITEMS=%s' % [t for _, _, _, t in res_items if t][:20])
+        print('OCR_ITEMS=%s' % all_texts[:20])
         return False
+
+    # 如果已经在公众号主页里了，直接放行，不再重复点击
+    if in_profile_page:
+        print('ALREADY_IN_ACCOUNT_PROFILE: %s' % cands[0][3])
+        return True
+
     cy, x0, x1, txt = cands[0]
     abs_x = l + int(x0 - 40)
     abs_y = t + int(cy)
@@ -1876,6 +1864,7 @@ def _locate_account(hwnd, l, t):
     print('CLICKED_ACCOUNT %s @ (%d,%d)' % (txt, abs_x, abs_y))
     time.sleep(SLEEP_SEARCH_RESULT)
     return True
+
 
 
 # ================================================================
@@ -2196,28 +2185,115 @@ def _step_search():
     hotkey(VK_ENTER)               # enter
     print('PASTED_ACCOUNT_AND_ENTER')
     time.sleep(SLEEP_SEARCH_RESULT)
+
+    # ====== 新增：重新绑定独立搜一搜窗口句柄 ======
+    # ====== 新增：重新绑定独立搜一搜窗口句柄 ======
+    soss_hwnd = None
+    @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
+    def _enum_soss(h, lparam):
+        nonlocal soss_hwnd
+        if not user32.IsWindowVisible(h) or h == _hwnd:
+            return True
+        length = user32.GetWindowTextLengthW(h)
+        if length > 0:
+            buf = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(h, buf, length + 1)
+            title = buf.value
+            # 【核心防呆】必须是 搜一搜窗口，且标题里包含你的账号名
+            if '搜一搜' in title and _account[:5] in title:
+                rect = win_rect(h)
+                if (rect[2] - rect[0]) > 200 and (rect[3] - rect[1]) > 200:
+                    soss_hwnd = h
+        return True
+
+    user32.EnumWindows(_enum_soss, 0)
+    if soss_hwnd:
+        _hwnd = soss_hwnd
+        _lt, _tt, _rt, _bt = win_rect(_hwnd)
+        hwnd, l, t, r, b = _hwnd, _lt, _tt, _rt, _bt
+        print(f'REBOUND_SOSS_WINDOW hwnd={hwnd} rect=({l},{t},{r},{b})')
+    # ==========================================
+    # ==========================================
+
+    # 3) OCR 定位目标公众号并点击
+    if not _locate_account(hwnd, l, t):
+        raise SystemExit(1)
     # 3) OCR 定位目标公众号并点击
     if not _locate_account(hwnd, l, t):
         raise SystemExit(1)
     # 4) 点击"文章"标签: article.png 模板实时侦查(位置随公众号变化,
     #    每次强制重查不读缓存; 重试 RETRY_ARTICLE_TAB 次)
-    art = None
-    for attempt in range(RETRY_ARTICLE_TAB):
-        art = get_article_coord(hwnd)
-        if art:
+    print("  步骤4: 寻找“文章”标签...")
+    art_clicked = False
+    art_y = 0
+
+    for attempt in range(3):
+        shot_tab, _ = screen_shot(hwnd)
+        tab_items = ocr_image(shot_tab)
+        for cy, x0, x1, txt in tab_items:
+            clean_t = txt.strip()
+            # 限制在右侧搜一搜窗口内(l + x0 > 950)，且位于主页导航栏高度(250 < cy < 600)
+            if (l + x0) <= 950 or not (250 < cy < 600):
+                continue
+
+            if clean_t == '文章':
+                # 情况A：单独识别出“文章”，点正中心
+                abs_x = l + int((x0 + x1) // 2)
+                abs_y = t + int(cy)
+                sendinput_click(abs_x, abs_y)
+                art_y = int(cy)
+                print('CLICKED_ARTICLE_TAB_EXACT @ (%d,%d)' % (abs_x, abs_y))
+                art_clicked = True
+                break
+            elif '全部' in clean_t and '文章' in clean_t:
+                # 情况B：整行连体识别成“全部 文章 视频号”，按比例取“文章”所在的中心位置（约 45% 处）
+                abs_x = l + int(x0 + (x1 - x0) * 0.45)
+                abs_y = t + int(cy)
+                sendinput_click(abs_x, abs_y)
+                art_y = int(cy)
+                print('CLICKED_ARTICLE_TAB_COMBINED (%s) @ (%d,%d)' % (clean_t, abs_x, abs_y))
+                art_clicked = True
+                break
+
+        if art_clicked:
             break
+        print("未识别到文章标签，等待1.5秒重试...")
         time.sleep(1.5)
-    if not art:
-        print('ERROR - ARTICLE_TEMPLATE_NOT_FOUND')
+
+    if not art_clicked:
+        print('ERROR - ARTICLE_TAB_NOT_FOUND')
         raise SystemExit(1)
-    time.sleep(SLEEP_SEARCH_RESULT)
+        
+    time.sleep(2.5) # 等待文章列表加载
     # 5) 解析首屏列表并落库;同时学习列表布局(col_split/min_y)供后续滚动复用。
     #    锚点: 点击"文章"标签后鼠标正停在标签上,该 y(窗口内相对)即列表起始。
-    art_y = int(art[1]) - t          # 绝对屏幕 y -> 窗口内相对 y
+    
     shot, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_articles.png'))
-    res_items = ocr_image(shot)
+    
+     # ====== 自适应窗口宽度判断 ======
+    w = r - l
+    h = b - t
+    if w > 800:
+        # 宽窗口（嵌在主窗口内）：只取右侧 30%
+        right_panel = shot.crop((int(w * 0.7), 0, w, h))
+        res_items_raw = ocr_image(right_panel)
+        res_items = [(cy, x0 + int(w * 0.7), x1 + int(w * 0.7), txt) for cy, x0, x1, txt in res_items_raw]
+        print("使用主窗口右侧 30% 裁剪模式")
+    else:
+        # 独立窄窗口（w ≈ 440）：直接识别全图
+        res_items = ocr_image(shot)
+        print("使用独立窗口全屏 OCR 模式")
+    # ==================================
     _learn_layout(res_items, anchor_y=art_y)
     items = parse_list_items(res_items, min_y=get_list_min_y())
+    # ======= 新增：解决 OCR 漏掉“今天”导致 date 为 None 的问题 =======
+    for it in items:
+        if not it.get('date'):
+            # 强行赋予你传入的结束日期（确保落在抓取范围内）
+            it['date'] = _end if _end else datetime.date.today().strftime('%Y-%m-%d')
+            print(f"  [修复] 自动补全缺失日期: {it['title'][:15]} -> {it['date']}")
+    # ====================================================================
+
     print('VISIBLE_ITEMS=%d' % len(items))
     for it in items[:5]:
         print('  - %s | %s | %s' % (it['title'][:30], it['date'], it['read_count']))
@@ -2312,13 +2388,6 @@ def find_article_onscreen(title):
 
 
 def _step_detail():
-    """= 原 tag3: 遍历 pending 文章,抓链接回写。
-    坐标直接取列表落库坐标(快路径): 本函数开始时做一次当前屏 OCR,
-    刷新当前屏可见文章的坐标(滚动后落库坐标会过期),然后对可见的
-    pending 直接用刷新后的坐标点击。不可见的 pending 跳过(留待后续
-    滚动/收尾回顶),绝不用过期坐标硬点。
-    每篇最多尝试两轮: 首次进详情页 -> 点更多找复制链接(重试3次);
-    失败则正常关标签,重新点击该报告再试一轮;两轮均失败才跳到下一篇。"""
     global _hwnd, _lt, _tt, _rt, _bt
     hwnd, l, t, r, b = _hwnd, _lt, _tt, _rt, _bt
     arts = _arts()
@@ -2328,9 +2397,26 @@ def _step_detail():
         print('DETAIL_NO_PENDING')
         return
     print('DETAIL_BATCH=%s' % ids)
-    # 一次 OCR 刷新当前屏所有可见文章的坐标(滚动后落库坐标会过期)
-    res_items, _ = list_ocr(hwnd)
-    vis = parse_list_items(res_items, min_y=get_list_min_y())
+    
+    # 刷新当前屏坐标
+    #res_items, _ = list_ocr(hwnd)
+    # 刷新当前屏坐标
+    print("  -> 正在获取右侧面板的文章列表...")
+    w = r - l
+    h = b - t
+    
+    shot, _ = screen_shot(hwnd)
+
+    # ====== 自适应窗口宽度判断 ======
+    if w > 800:
+        right_panel = shot.crop((int(w * 0.7), 0, w, h))
+        res_items_raw = ocr_image(right_panel)
+        res_items = [(cy, x0 + int(w * 0.7), x1 + int(w * 0.7), txt) for cy, x0, x1, txt in res_items_raw]
+    else:
+        res_items = ocr_image(shot)
+    # ==================================
+    
+    vis = parse_list_items(res_items, min_y=get_list_min_y(), col_split=9999)
     live_by_title = {}
     for it in vis:
         nt = _norm_title(it.get('title', ''))
@@ -2340,16 +2426,20 @@ def _step_detail():
         if cx0 is None:
             cx0 = it.get('cx', 0)
         live_by_title[nt] = (l + int(cx0) + 10, t + int(it.get('cy', 0)))
+
+    # ================= 加下面这行 =================
+    print("【调试】当前屏幕上实时 OCR 找出的所有标题字典: ", live_by_title)
+    # ==============================================
+
     for aid in ids:
         item = by_id.get(aid)
         if not item:
-            print('ERROR - ID_NOT_FOUND %s' % aid)
             continue
         title = item.get('title', '')
         print('==== ID %s: %s' % (aid, title[:36]))
         t0 = time.time()
         target = _norm_title(title)
-        # 快路径: 用当前屏刷新坐标(精确匹配优先,模糊兜底 OCR 拼写噪声)
+        
         coord = live_by_title.get(target)
         if coord is None:
             best, best_ratio = None, 0.0
@@ -2359,53 +2449,136 @@ def _step_detail():
                     best_ratio, best = ratio, c2
             if best and best_ratio >= TITLE_FUZZY_RATIO:
                 coord = best
-                print('TITLE_FUZZY ratio=%.2f "%s"~"%s"' % (best_ratio, title[:18], title[:18]))
+        # ==================== 加在这里 ====================
+        print(f"【调试】当前操作的目标标题: {title[:15]}")
+        print(f"【调试】从屏幕匹配到的 coord 坐标: {coord}")
+        print(f"【调试】存储中的原始坐标: cx={item.get('cx')}, cy={item.get('cy')}")
+        print(f"【调试】当前窗口偏移量: l={l}, t={t}")
+        # ==================================================
+
         if coord is None:
-            print('SKIP_NOT_ONSCREEN id=%s (当前屏不可见,留待后续轮次/回顶)' % aid)
+            print('SKIP_NOT_ONSCREEN id=%s' % aid)
             continue
+            
         abs_x, abs_y = coord
         cu = None
+        
         for rnd in range(RETRY_DETAIL_ROUNDS):
-            # 重试轮(极少): 列表可能又变动,现场再定位一次
             if rnd > 0:
                 live = find_article_onscreen(title)
                 if live:
                     abs_x, abs_y = live
-                    print('RELOCATED_LIVE @ (%d,%d)' % (abs_x, abs_y))
+                    
+            # 1. 点击进入内嵌文章页
+            # 【新增】先备份当前文章的坐标，供关闭窗口后退回使用
+            last_article_x = abs_x + 30
+            last_article_y = abs_y
+            
+            click_at(last_article_x, last_article_y)
+            print('CLICKED_ARTICLE @ (%d,%d) round=%d' % (last_article_x, last_article_y, rnd))
+            time.sleep(2.0) 
+            
+            # 2. 寻找并点击右上角的小方框（独立窗口显示按钮）
+            # 注意：由于内嵌页在右侧，这个按钮也一定在右侧区域
+            open_win_region = (int((_rt-_lt)*0.6), 0, _rt-_lt, 100)
+            open_win_btn = click_template(hwnd, os.path.join(WX_DIR, 'open_window.png'), 
+                                          region=open_win_region, 
+                                          label='OPEN_WINDOW')
+            
+            current_hwnd = hwnd
+            if open_win_btn:
+                print("  -> 成功点击独立窗口按钮，等待新窗口弹出...")
+                time.sleep(2.0) # 等待新窗口加载
+                
+                # 获取当前最前方的窗口
+                new_hwnd = user32.GetForegroundWindow()
+                if new_hwnd and new_hwnd != hwnd:
+                    current_hwnd = new_hwnd
+                    print("  -> 焦点已切换至独立窗口")
+                    time.sleep(1.0)
                 else:
-                    print('RELOCATE_MISS,沿用刷新坐标 (%d,%d)' % (abs_x, abs_y))
-            click_at(abs_x, abs_y)
-            print('CLICKED_BY_COORD (%d,%d) round=%d' % (abs_x, abs_y, rnd))
-            time.sleep(SLEEP_DETAIL_LOAD)   # 等文章正文加载出来,再点"更多"按钮
-            move_cursor_to_tabbar(l, t, r, b)   # 鼠标移到顶部标签栏,避免悬停内容区
-            cu, _ = _find_copy_url(hwnd, aid, rnd)
+                    print("  -> 警告：未检测到新窗口获得焦点")
+            else:
+                print("  -> 错误：没有找到 open_window.png 图标")
+
+            # 3. 在目标窗口寻找并点击“...”
+            # 动态计算右上角区域，防止分辨率不同导致匹配失败
+            cl, ct, cr, cb = win_rect(current_hwnd)
+            cw, ch = cr - cl, cb - ct
+            more_region = (int(cw * 0.7), 0, int(cw * 0.95), 100)
+            
+            print("  -> 正在独立窗口中全图寻找带圈的三个点...")
+            more = click_template(current_hwnd, _MORE_TPL, 
+                                  region=None, 
+                                  threshold=0.65, # 稍微降低一点阈值
+                                  label='MORE')
+            
+            if more:
+                print("  -> 成功点击 ... 按钮，等待菜单弹出")
+                time.sleep(1.0)
+                # 4. 查找“复制链接”
+                cu = None
+                for attempt in range(RETRY_COPY_URL):
+                    cu = find_template(current_hwnd, _COPY_URL_TPL, 
+                                       region=get_region('menu', current_hwnd),
+                                       threshold=0.7)
+                    if cu:
+                        break
+                    time.sleep(0.5)
+                
+                if cu:
+                    click_at(cu[0], cu[1])
+                    print('  -> 成功点击复制链接')
+                    time.sleep(0.5)
+                    url = get_clipboard().strip()
+                    
+                    if url and 'http' in url:
+                        item['url'] = url
+                        out = {k: arts.get(k) for k in ('account', 'tab', 'start', 'end',
+                                                         'earliest_visible', 'passed_start')}
+                        out['items'] = list(by_id.values())
+                        write_json(ARTICLES_FILE, out)
+                        print('ID_%s_DONE: %s' % (aid, url[:60]))
+                else:
+                    print("  -> 错误：找到了 ... 但没找到 copy_url.png")
+            else:
+                print("  -> 错误：在独立窗口没找到 more.png")
+
+            # 5. 收尾清理窗口
+            if current_hwnd != hwnd:
+                print("  -> 正在关闭独立窗口...")
+                
+                # 1. 确保焦点在独立窗口上
+                _force_foreground(current_hwnd)
+                time.sleep(0.3)
+                
+                # 2. 使用 Alt + F4 发送标准的关闭指令（最温和、最符合真人操作）
+                # 0x12 是 Alt 键，0x73 是 F4 键
+                hotkey(0x12, 0x73) 
+                time.sleep(1.5) # 给微信留出处理关闭请求的时间
+                
+                # 3. 如果 Alt+F4 没关掉（极小概率），再用底层消息兜底
+                if user32.IsWindow(current_hwnd):
+                    user32.PostMessageW(int(current_hwnd), 0x0010, 0, 0)
+                    time.sleep(1.0)
+
+                # 4. 切回主窗口，并留出渲染时间
+                print("  -> 切回主窗口，等待页面重新渲染...")
+                _force_foreground(hwnd)
+                time.sleep(2.0) # 核心：给微信网页 2 秒的重绘时间，防止白屏
+                
+                ## 5. 移动鼠标（不要放中间，放到右上角的标签栏附近，防误触）
+                # ================= 新增：鼠标退回刚才点击的文章位置 =================
+                # 直接使用刚才备份的坐标。为了防止刚好悬停在卡片上触发悬浮窗，
+                # 我们把 Y 轴往下微调 30 像素，落在卡片的空白处或下一行
+                user32.SetCursorPos(int(last_article_x), int(last_article_y) + 30)
+                print(f"  -> 鼠标已退回上一篇文章附近: ({last_article_x}, {last_article_y + 30})")
+            
+            # 【删除原版的 Ctrl+W】因为在独立窗口模式下，Alt+F4 已经彻底关闭它了。
+            # 如果这里再发 Ctrl+W，极大概率会把主窗口的搜一搜页面关掉，导致彻底白屏。
+            
             if cu:
                 break
-            _close_detail_tab()   # 本轮失败: 正常关标签,下一轮重新点击该报告
-        if not cu:
-            print('ERROR - COPY_URL_FAILED_2ROUNDS id=%s' % aid)
-            continue
-        click_at(cu[0], cu[1])
-        print('CLICKED_COPY_URL @ (%d,%d) score=%.2f' % (cu[0], cu[1], cu[2]))
-        time.sleep(0.2)
-        url = get_clipboard().strip()
-        print('URL=%s' % url[:80])
-        if not url or 'http' not in url:
-            print('ERROR - URL_NOT_IN_CLIPBOARD id=%s' % aid)
-            _close_detail_tab()
-            continue
-        item['url'] = url
-        out = {k: arts.get(k) for k in ('account', 'tab', 'start', 'end',
-                                         'earliest_visible', 'passed_start')}
-        out['items'] = list(by_id.values())
-        write_json(ARTICLES_FILE, out)
-        # 成功: 关标签后等 1s 完全关闭,再点下一篇
-        _close_detail_tab()
-        print('ID_%s_DONE (%.1fs): %s' % (aid, time.time() - t0, url[:60]))
-    arts = _arts()
-    done = sum(1 for a in arts['items'] if a.get('url'))
-    print('DETAIL_ALL_DONE total=%d with_url=%d' % (len(arts['items']), done))
-
 
 def _wait_list_stable(hwnd, min_y=None, max_tries=5, settle=1.5):
     """滚动后等待列表稳定: 连续两次 OCR 的可见标题集合一致才返回当前屏条目。
@@ -2483,15 +2656,18 @@ def _scroll_by_items(hwnd, l, t, r, b, n_items=SCROLL_ITEMS_PER_PAGE, target_px=
         else:
             print('ITEM_HEIGHT_FROM_CACHE=%.1f' % item_h)
         target_px = n_items * item_h
-    px_per_click = get_scroll_px(hwnd, l, t, r, b)
-    clicks = max(1, int(round(target_px / px_per_click)))
-    scroll_abs_x = l + int((r - l) * 0.5)
-    scroll_abs_y = t + int((b - t) * 0.7)
-    print('SCROLL_BY_ITEMS n=%d item_h=%.1fpx px/click=%.1f target=%.1fpx clicks=%d'
-          % (n_items, calib.get('item_height', 0) or 0, px_per_click, target_px, clicks))
-    scroll_wheel(scroll_abs_x, scroll_abs_y, clicks, 'down')
-    return clicks
-
+    px_per_click, already_clicks = get_scroll_px(hwnd, l, t, r, b)
+    total_needed_clicks = max(1, int(round(target_px / px_per_click)))
+    remain_clicks = total_needed_clicks - already_clicks
+    
+    scroll_abs_x = l + int((r - l) * 0.88)
+    scroll_abs_y = t + int((b - t) * 0.5)
+    print('SCROLL_BY_ITEMS n=%d px/click=%.1f target=%.1fpx total=%d already=%d remain=%d'
+          % (n_items, px_per_click, target_px, total_needed_clicks, already_clicks, max(0, remain_clicks)))
+          
+    if remain_clicks > 0:
+        scroll_wheel(scroll_abs_x, scroll_abs_y, remain_clicks, 'down')
+    return max(total_needed_clicks, already_clicks)
 
 def _step_scroll():
     """= 原 tag2: 向下滚动"当前屏报告的垂直跨距" -> 等 0.5s -> 与 tag1 完全相同的
@@ -2508,8 +2684,27 @@ def _step_scroll():
     seen_titles = {_norm_title(a.get('title', '')) for a in arts0['items']
                    if a.get('title')}
     # 1) 先分析当前屏: 计算滚动距离(最下 - 最上报告的 cy 差,即一屏内容跨距)
+    #shot0, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_pre_scroll.png'))
+    #items0 = parse_list_items(ocr_image(shot0), min_y=get_list_min_y())
+    w = r - l
+    h = b - t
     shot0, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_pre_scroll.png'))
-    items0 = parse_list_items(ocr_image(shot0), min_y=get_list_min_y())
+    # 只截取右侧 30%
+    if w > 800:
+        right_panel0 = shot0.crop((int(w * 0.7), 0, w, h))
+        res_items_raw0 = ocr_image(right_panel0)
+        res_items0 = [(cy, x0 + int(w * 0.7), x1 + int(w * 0.7), txt) for cy, x0, x1, txt in res_items_raw0]
+    else:
+        res_items0 = ocr_image(shot0)
+    items0 = parse_list_items(res_items0, min_y=get_list_min_y(), col_split=9999)
+    # ================= 增加鼠标位置 DEBUG =================
+    import ctypes
+    pt = ctypes.wintypes.POINT()
+    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+    print(f'【调试】SCROLL_SPAN_CALC 前鼠标真实位置: X={pt.x}, Y={pt.y}')
+    print(f'【调试】窗口边界 l={l}, t={t}, r={r}, b={b}')
+    # ======================================================
+
     if items0:
         span_px = float(items0[-1]['cy']) - float(items0[0]['cy'])
         print('SCROLL_SPAN_CALC first=%d last=%d span=%.1fpx'
@@ -2536,18 +2731,48 @@ def _step_scroll():
             return result
     # 2) 按该跨距滚动(滚到底触发微信自动加载下一页)。
     #    无需额外等待: 主循环先 detail(tag3)抓完才进入本函数,列表已稳定。
+    # ======== 新增：遇到大图强制滚 400 像素 ========
+    # 如果 OCR 没认出字（span为0），或者两篇文章挨得太近，强行拉大滚动距离
+    if not span_px or span_px < 200:
+        span_px = 400.0
+        print('SCROLL_FORCE_DOWN - 识别不到有效跨距，强行向下滚动 400px 避开大图')
+    # ===============================================
+    
     _scroll_by_items(hwnd, l, t, r, b,
                      SCROLL_ITEMS_PER_PAGE,
-                     target_px=span_px if span_px and span_px > 0 else None)
+                     target_px=span_px)
+    # 👇 加上这两行 👇
+    print(f"【调试】本次滚动使用的 X 坐标: {l + int(w * 0.8)}")
+    print(f"【调试】本次滚动使用的 Y 坐标: {t + int(h * 0.7)}")
+    # =================
+
     # 3) 与 tag1 完全相同的列表分析: 整窗口截图 -> OCR -> parse_list_items
+    #shot, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_scroll.png'))
+    #res_items = ocr_image(shot)
+    #items = parse_list_items(res_items, min_y=get_list_min_y())
     shot, _ = screen_shot(hwnd, os.path.join(WX_DIR, 'tag_all_scroll.png'))
-    res_items = ocr_image(shot)
-    items = parse_list_items(res_items, min_y=get_list_min_y())
+    # 只截取右侧 30%
+    if w > 800:
+        right_panel = shot.crop((int(w * 0.7), 0, w, h))
+        res_items_raw = ocr_image(right_panel)
+        res_items = [(cy, x0 + int(w * 0.7), x1 + int(w * 0.7), txt) for cy, x0, x1, txt in res_items_raw]
+    else:
+        res_items = ocr_image(shot)
+    items = parse_list_items(res_items, min_y=get_list_min_y(), col_split=9999)
+
     # 4) 去重 + 落库: 只保留符合条件(非标签栏、日期在范围内)且未落库的条目
+    # ======== 新增：解决遇到大图导致 date 为 None 的问题 ========
+    for it in items:
+        if it.get('title') and not it.get('date'):
+            # 强制赋予结束日期（确保能入库），或者你可以给它赋今天的日期
+            it['date'] = _end if _end else datetime.date.today().strftime('%Y-%m-%d')
+    # ============================================================
+
     new_items = [it for it in items
                  if it['title'] and not is_tab_bar(it['title'])
                  and it.get('date') and in_range(it['date'], _start, _end)
                  and _norm_title(it['title']) not in seen_titles]
+
     for it in new_items:
         seen_titles.add(_norm_title(it['title']))
         print('SCROLL_NEW: %s | %s' % (it['title'][:30], it['date']))
@@ -2675,9 +2900,25 @@ def close_phase():
     if wd and os.path.isdir(wd):
         src = os.path.join(wd, ARTICLES_FILE)
         if os.path.exists(src):
-            dst = os.path.join(WX_DIR, ARTICLES_FILE)
+            # 读取临时目录里的数据，获取公众号名称
+            try:
+                with open(src, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    account_name = data.get('account', '未知公众号')
+            except Exception:
+                account_name = '未知公众号'
+                
+            # 生成带公众号名字和时间的文件名（清理掉Windows文件名不允许的字符）
+            import re
+            import datetime
+            safe_account = re.sub(r'[\\/:*?"<>|]', '_', account_name)
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            filename = f"articles_{safe_account}_{timestamp}.json"
+            
+            dst = os.path.join(WX_DIR, filename)
             shutil.copy2(src, dst)
             print('ARTICLES_SAVED %s' % dst)
+
     hwnd = find_wx_window()
     if hwnd:
         close_window(hwnd)
@@ -2743,74 +2984,51 @@ def main():
                          ensure_ascii=False))
         return 2
 
-    # ---- 注册中断处理器: Ctrl+C / 关窗 / Ctrl+Break 时停止整个自动化 ----
+    # ---- 注册中断处理器 ----
     install_ctrl_handler()
 
-    # ---- 建独立临时工作目录(拷贝 .tag/.py/.png) ----
+    # ---- 建独立临时工作目录 ----
     setup_work_dir()
     cfg = write_config(args.account, args.tab, args.start or None,
                        args.end or None, args.limit)
-    set_clipboard(cfg['account'])          # 带重试,微信可能持有剪贴板
+    set_clipboard(cfg['account'])
     print('已复制公众号名称到剪贴板: %s' % cfg['account'])
 
-    # ---- 清理残留搜一搜窗口: 每次运行必须从"点击入口"完整流程开始 ----
-    # 若上次运行异常中断/用户手动打开, 搜一搜窗口可能仍开着; 若直接复用,
-    # flow_begin 会判定 SOSS_ALREADY_OPEN 而跳过点击入口(home.png/搜索框),
-    # 导致流程建立在未知状态的旧窗口上。先关闭残留窗口, 确保从微信主窗口
-    # 重新走完整入口链路(点击入口 -> 进入搜一搜 -> 搜索 -> 抓取)。
-    stale = find_wx_window()
-    if stale:
-        close_window(stale)
-        print('SOSS_STALE_CLOSED hwnd=%s - 已关闭残留搜一搜窗口,重新走完整入口流程' % stale)
-        time.sleep(SLEEP_UI_MID)
+    #stale = find_wx_window()
+    #if stale:
+    #    close_window(stale)
+    #    print('SOSS_STALE_CLOSED hwnd=%s' % stale)
+    #    time.sleep(SLEEP_UI_MID)
 
-    # ---- 前置侦查: 确认主窗口 home 图标可定位(原生 click 前的健康检查) ----
     main_hwnd = find_weixin_main()
     ok, found = preflight_main(main_hwnd)
     if not ok:
-        # 侧边栏无 home 图标(部分微信版本): 回退搜索框 + "搜索网络结果"方案
-        print('HOME_ICON_PATH_FAILED - 回退搜索框 + 搜索网络结果方案')
-        soss = open_soss_from_main(main_hwnd, cfg['account'])
-        if not soss:
-            print(json.dumps({'status': 'failed',
-                              'reason': 'soss_open_failed',
-                              'hint': '点击微信侧边栏图标/搜索框后未出现搜一搜窗口'},
-                             ensure_ascii=False))
-            return 2
-        print('SOSS_OPENED hwnd=%s (fallback)' % soss)
-        # fallback 方案已直接打开 SOSS: 后续 py 块从已开窗口继续
-        rc, stdout = run_tag('tag_all.tag', timeout=21600, idle_timeout=300)
-        print(stdout)
-        print('TagUI tag_all 退出码: %d' % rc)
-        if rc in (124, 125):
-            print(json.dumps({'status': 'failed', 'phase': 'all',
-                              'reason': 'tag_all_timeout' if rc == 124
-                              else 'idle_timeout'},
-                             ensure_ascii=False, indent=2))
-            close_phase()
-            return 2
-        close_phase()
-        return 0 if rc == 0 else 2
+        print('HOME_ICON_PATH_FAILED - 回退搜索框方案')
+        open_soss_from_main(main_hwnd, cfg['account'])
+        print('SOSS_OPENED_IN_MAIN_WINDOW (fallback)')
+    else:
+        print('主窗口图标侦查通过，直接进入搜一搜流程')
+        open_soss_via_home(main_hwnd, os.path.join(WX_DIR, 'home.png'))
+        time.sleep(2)
 
-    # ---- 单次 TagUI 进程执行 tag_all.tag: 内部 flow_begin 侦查 ->
-    #     原生 click home.png -> flow_wait_soss -> click input_field.png ->
-    #     flow_fill_search -> click article.png -> flow_articles ----
-    print('==== phase=all account=%s tab=%s range=%s~%s ===='
-          % (cfg['account'], cfg['tab'], cfg['start'], cfg['end']))
-    rc, stdout = run_tag('tag_all.tag', timeout=21600, idle_timeout=300)
-    print(stdout)
-    print('TagUI tag_all 退出码: %d' % rc)
-    if rc in (124, 125):
-        print(json.dumps({'status': 'failed', 'phase': 'all',
-                          'reason': 'tag_all_timeout' if rc == 124
-                          else 'idle_timeout'},
-                         ensure_ascii=False, indent=2))
-        close_phase()
-        return 2
+    # 【关键修改】不再调用 run_tag('tag_all.tag')，直接用 Python 执行状态机
+    print('==== 开始执行 Python 状态机 ====')
+        # 👇 加入这两行 👇
+    os.environ['WX_WORKDIR'] = get_work_dir()
+    os.environ['WX_SOURCE_DIR'] = WX_DIR
 
-    # ---- 自动收尾: 保存结果 + 关窗 + 清理 ----
+    try:
+        run_pipeline()
+        print('==== Python 状态机执行完毕 ====')
+    except SystemExit as e:
+        print('流程中途退出，错误码: %s' % e.code)
+    except Exception as e:
+        print('发生未捕获异常: %s' % e)
+    
+    # 自动收尾
     close_phase()
-    return 0 if rc == 0 else 2
+    return 0
+
 
 
 if __name__ == '__main__':
